@@ -338,6 +338,31 @@ static int CUDAAPI cuvid_handle_picture_decode(void *opaque, CUVIDPICPARAMS* pic
     if (ctx->internal_error < 0)
         return 0;
 
+    if(ctx->nb_surfaces!=25){
+        CUVIDPARSERDISPINFO dispInfo;
+        memset(&dispInfo, 0, sizeof(dispInfo));
+        dispInfo.picture_index = picparams->CurrPicIdx;
+        dispInfo.progressive_frame = !picparams->field_pic_flag;
+        dispInfo.top_field_first = picparams->bottom_field_flag ^ 1;
+
+        CuvidParsedFrame parsed_frame = { { 0 } };
+
+        parsed_frame.dispinfo = dispInfo;
+        ctx->internal_error = 0;
+        // For some reason, dispinfo->progressive_frame is sometimes wrong.
+        parsed_frame.dispinfo.progressive_frame = ctx->progressive_sequence;
+
+        if (ctx->deint_mode_current == cudaVideoDeinterlaceMode_Weave) {
+            av_fifo_generic_write(ctx->frame_queue, &parsed_frame, sizeof(CuvidParsedFrame), NULL);
+        } else {
+            parsed_frame.is_deinterlacing = 1;
+            av_fifo_generic_write(ctx->frame_queue, &parsed_frame, sizeof(CuvidParsedFrame), NULL);
+            if (!ctx->drop_second_field) {
+                parsed_frame.second_field = 1;
+                av_fifo_generic_write(ctx->frame_queue, &parsed_frame, sizeof(CuvidParsedFrame), NULL);
+            }
+        }
+    }
     return 1;
 }
 
@@ -407,7 +432,7 @@ static int cuvid_decode_packet(AVCodecContext *avctx, const AVPacket *avpkt)
         cupkt.payload = avpkt->data;
 
         if (avpkt->pts != AV_NOPTS_VALUE) {
-            cupkt.flags = CUVID_PKT_TIMESTAMP;
+            cupkt.flags = CUVID_PKT_ENDOFPICTURE | CUVID_PKT_TIMESTAMP;
             if (avctx->pkt_timebase.num && avctx->pkt_timebase.den)
                 cupkt.timestamp = av_rescale_q(avpkt->pts, avctx->pkt_timebase, (AVRational){1, 10000000});
             else
@@ -965,11 +990,15 @@ static av_cold int cuvid_decode_init(AVCodecContext *avctx)
     }
 
     ctx->cuparseinfo.ulMaxNumDecodeSurfaces = ctx->nb_surfaces;
-    ctx->cuparseinfo.ulMaxDisplayDelay = 4;
+    ctx->cuparseinfo.ulMaxDisplayDelay = 0;
     ctx->cuparseinfo.pUserData = avctx;
     ctx->cuparseinfo.pfnSequenceCallback = cuvid_handle_video_sequence;
     ctx->cuparseinfo.pfnDecodePicture = cuvid_handle_picture_decode;
-    ctx->cuparseinfo.pfnDisplayPicture = cuvid_handle_picture_display;
+    if(ctx->nb_surfaces == 25){
+        ctx->cuparseinfo.pfnDisplayPicture = cuvid_handle_picture_display;
+    } else {
+        ctx->cuparseinfo.pfnDisplayPicture = NULL;
+    }
 
     ret = CHECK_CU(ctx->cudl->cuCtxPushCurrent(cuda_ctx));
     if (ret < 0)
